@@ -105,6 +105,9 @@ class SelectObservations(object):
     self._env = env
     self._keys = keys
 
+  def __getattr__(self, name):
+    return getattr(self._env, name)
+
   @property
   def observation_space(self):
     spaces = self._env.observation_space.spaces
@@ -163,8 +166,9 @@ class PixelObservations(object):
   def _render_image(self):
     image = self._env.render('rgb_array')
     if image.shape[:2] != self._size:
-      kwargs = dict(mode='edge', order=1, preserve_range=True)
-      image = skimage.transform.resize(image, self._size, **kwargs)
+      kwargs = dict(
+          output_shape=self._size, mode='edge', order=1, preserve_range=True)
+      image = skimage.transform.resize(image, **kwargs).astype(image.dtype)
     if self._dtype and image.dtype != self._dtype:
       if image.dtype in (np.float32, np.float64) and self._dtype == np.uint8:
         image = (image * 255).astype(self._dtype)
@@ -174,6 +178,34 @@ class PixelObservations(object):
         message = 'Cannot convert observations from {} to {}.'
         raise NotImplementedError(message.format(image.dtype, self._dtype))
     return image
+
+
+class ObservationToRender(object):
+
+  def __init__(self, env, key='image'):
+    self._env = env
+    self._key = key
+    self._image = None
+
+  def __getattr__(self, name):
+    return getattr(self._env, name)
+
+  @property
+  def observation_space(self):
+    return gym.spaces.Dict({})
+
+  def step(self, action):
+    obs, reward, done, info = self._env.step(action)
+    self._image = obs.pop(self._key)
+    return obs, reward, done, info
+
+  def reset(self):
+    obs = self._env.reset()
+    self._image = obs.pop(self._key)
+    return obs
+
+  def render(self, *args, **kwargs):
+    return self._image
 
 
 class OverwriteRender(object):
@@ -209,6 +241,32 @@ class ActionRepeat(object):
       total_reward += reward
       current_step += 1
     return observ, total_reward, done, info
+
+
+class NormalizeActions(object):
+
+  def __init__(self, env):
+    self._env = env
+    low, high = env.action_space.low, env.action_space.high
+    self._enabled = np.logical_and(np.isfinite(low), np.isfinite(high))
+    self._scale = np.where(
+        self._enabled, (high - low) / 2, np.ones_like(low))
+    self._offset = np.where(
+        self._enabled, low + (high - low) / 2, np.zeros_like(low))
+
+  def __getattr__(self, name):
+    return getattr(self._env, name)
+
+  @property
+  def action_space(self):
+    space = self._env.action_space
+    low = np.where(self._enabled, -np.ones_like(space.low), space.low)
+    high = np.where(self._enabled, np.ones_like(space.high), space.high)
+    return gym.spaces.Box(low, high)
+
+  def step(self, action):
+    action = (action - self._offset) / self._scale
+    return self._env.step(action)
 
 
 class DeepMindWrapper(object):
@@ -263,9 +321,10 @@ class DeepMindWrapper(object):
 class LimitDuration(object):
   """End episodes after specified number of steps."""
 
-  def __init__(self, env, duration):
+  def __init__(self, env, duration, ignore_done=False):
     self._env = env
     self._duration = duration
+    self._ignore_done = ignore_done
     self._step = None
 
   def __getattr__(self, name):
@@ -279,8 +338,8 @@ class LimitDuration(object):
     if self._step >= self._duration:
       done = True
       self._step = None
-    else:
-      assert not done
+    elif self._ignore_done:
+      done = False
     return observ, reward, done, info
 
   def reset(self):
